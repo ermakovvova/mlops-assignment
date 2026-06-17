@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -111,42 +112,79 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
-    """Decide whether state.execution plausibly answers state.question.
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Parse the verifier's reply into (ok, issue).
 
-    Follow the generate_sql_node pattern: build messages from the VERIFY_*
-    prompts, call llm(), parse the reply. Ask the model for a small JSON object
-    like {"ok": bool, "issue": str} and parse it defensively - the model may
-    wrap it in prose or fences. state.execution.render() gives you a compact
-    view of the rows or error to feed into the prompt.
-
-    Return: {"verify_ok": <bool>, "verify_issue": <str>}.
-    What counts as "not plausible" is yours to define - see the Phase 3 targets
-    in the README.
+    Defensive: the model may wrap the JSON in prose or ```json fences. Grab the
+    first {...} block and parse it. On any parse failure we fail OPEN (ok=True)
+    so a flaky verifier doesn't burn the whole iteration budget on a query that
+    likely already works.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return True, ""
+    try:
+        obj = json.loads(match.group(0))
+    except (ValueError, json.JSONDecodeError):
+        return True, ""
+    ok = bool(obj.get("ok", True))
+    issue = str(obj.get("issue", "") or "")
+    return ok, ("" if ok else issue)
+
+
+def verify_node(state: AgentState) -> dict:
+    """Decide whether state.execution plausibly answers state.question."""
+    result_text = state.execution.render() if state.execution else "ERROR: no execution result"
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=result_text,
+        )),
+    ])
+    ok, issue = _parse_verdict(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [
+            {"node": "verify", "ok": ok, "issue": issue}
+        ],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
-    """Produce a revised SQL query given state.verify_issue and the prior attempt.
-
-    Same shape as generate_sql_node, but the prompt should include the failing
-    SQL, its execution result, and the verifier's complaint so the model can fix
-    it. Bump the iteration counter the same way generate_sql_node does so the
-    loop terminates.
-
-    Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
-    """
-    raise NotImplementedError("Implement in Phase 3")
+    """Produce a revised SQL query given state.verify_issue and the prior attempt."""
+    result_text = state.execution.render() if state.execution else "ERROR: no execution result"
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            result=result_text,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [
+            {"node": "revise", "sql": sql, "fixing": state.verify_issue}
+        ],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
-    Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
-    the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
+    End when the verifier was happy or we've spent the iteration budget;
+    otherwise loop into revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------

@@ -39,3 +39,78 @@ All running via `docker compose up -d`:
 - **Prometheus** (port 9090) — scrapes vLLM `/metrics` every 5s via `host.docker.internal:8000`
 - **Grafana** (port 3000) — auto-provisioned with Prometheus datasource and starter dashboard
 - **Langfuse** (port 3001) — local instance for agent tracing (Phase 4)
+
+---
+
+## Phase 2: Serving Dashboard (o11y core)
+
+Dashboard JSON: `infra/grafana/provisioning/dashboards/serving.json` (uid `vllm-serving`), auto-provisioned into Grafana. Replaces the 2-panel starter with a summary row + 6 timeseries across the three required categories.
+
+### At-a-glance row (stat panels)
+SLO-aligned numbers a teammate can read in one glance:
+- **P95 E2E latency** — green < 5s, red ≥ 5s (Phase 6 SLO).
+- **Request throughput** — green ≥ 10 RPS (Phase 6 SLO), red below.
+- **KV cache usage** — green / yellow ≥ 0.7 / red ≥ 0.9.
+- **Requests waiting** — queue depth; yellow ≥ 1, red ≥ 10.
+
+### Latency — "is it slow, and where in the lifecycle?"
+- **E2E request latency** (p50/p95/p99) from `vllm:e2e_request_latency_seconds_bucket`, with a 5s SLO threshold line.
+- **Time to first token** (p50/p95/p99) from `vllm:time_to_first_token_seconds_bucket` — queueing + prefill cost.
+- **Inter-token latency** (p50/p95) from `vllm:time_per_output_token_seconds_bucket` — decode-step efficiency under batching.
+
+Splitting E2E into TTFT + ITL localizes the time: high TTFT → prefill/queue bound; high ITL → decode bound.
+
+### Throughput
+- **Request concurrency & queue**: completed `rate(vllm:request_success_total)`, `vllm:num_requests_running`, `vllm:num_requests_waiting` — served vs in-flight vs queued.
+- **Token throughput**: `rate(vllm:prompt_tokens_total)` (prefill) and `rate(vllm:generation_tokens_total)` (decode).
+
+### KV cache — "headroom, or about to evict?"
+- **KV cache usage & evictions**: `vllm:gpu_cache_usage_perc` (left axis, headroom) + `rate(vllm:num_preemptions_total)` (right axis). Preemptions > 0 is the direct signal vLLM is evicting/recomputing because the cache is full — you're out of headroom and concurrency is being throttled.
+
+### Notes
+- `histogram_quantile` exprs aggregate with `sum by (le)` so percentiles stay correct across multiple label series.
+- Percentiles use a `[1m]` rate window against a 5s scrape interval.
+- **Screenshot pending** (`screenshots/grafana_serving.png`): requires vLLM live on the H100. Capture while driving load (`uv run python load_test/driver.py --rps 8 --duration 300`); panels read "No data" until the endpoint emits `/metrics`.
+
+---
+
+## Phase 3: Text-to-SQL Agent (LangGraph)
+
+A self-consistency-inspired agent: generate SQL → execute → verify → revise on failure, capped at `MAX_ITERATIONS = 3`.
+
+```
+START → attach_schema → generate_sql → execute → verify ──ok──→ END
+                                          ▲                │
+                                          └──── revise ◄───┘ (ok=false & under cap)
+```
+
+### Nodes (`agent/graph.py`)
+- **generate_sql** (worked example) — schema + question → SQL.
+- **execute** (provided) — runs SQL read-only against the sqlite DB.
+- **verify** — feeds question + SQL + `ExecutionResult.render()` to the model, asks for `{"ok": bool, "issue": str}`. Parsed by `_parse_verdict`, which regex-extracts the first `{...}` and **fails open** (`ok=true`) on unparseable output, so a flaky verifier never burns the iteration budget on a query that already works.
+- **revise** — feeds failing SQL + result + verifier complaint back, returns corrected SQL, bumps `iteration`.
+- **route_after_verify** — ends when `verify_ok` or `iteration >= MAX_ITERATIONS`, else loops into revise.
+
+`iteration` is incremented in generate_sql and revise, so the cap allows 1 generate + up to 2 revises.
+
+### Prompts (`agent/prompts.py`)
+- **Generate/Revise**: SQLite expert, schema-grounded, output only a ```sql fenced block (extracted by `_extract_sql`), read-only SELECT, double-quoted identifiers.
+- **Verify**: flags NOT-ok on SQL error, 0 rows when rows are implied, columns that don't address the question, or ignored filters; lenient on formatting; bare-JSON verdict.
+
+### Validation (against real `Qwen/Qwen3-30B-A3B-Instruct-2507` on Nebius)
+Ran 12 questions from `evals/eval_set.jsonl` end-to-end:
+- All 12 produced executable SQL.
+- **4/12 triggered a revise** (≥ 1 required) — all single-row aggregate results (avg/count/percentage), which the verifier flags as implausibly small.
+- Revisers loop to the cap then return correct SQL; the loop terminates cleanly.
+
+Known sharpness: the verifier is over-eager on single-value aggregates, spending iterations without changing the answer. Tightening the verify prompt (treat single-value aggregates as expected) or switching verify to structured output would cut wasted iterations — a Phase 5 eval tuning target.
+
+### Backend config fix
+`.env` had `OPENAI_API_KEY` carrying a literal `NEBIUS_KEY=` prefix and a stray `VLLM_MODEL=gpt-4o-mini` overriding the Qwen model. Both corrected; the agent now serves against the real Qwen3-30B endpoint.
+
+### Run
+```bash
+uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
+curl -X POST http://localhost:8001/answer -H "Content-Type: application/json" \
+  -d '{"question": "...", "db": "formula_1"}'
+```
