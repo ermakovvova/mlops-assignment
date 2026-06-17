@@ -57,8 +57,53 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 # ---------- Implement these (Phase 5) ----------------------------------
 
 def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    """Score one question, capturing correctness at each agent iteration.
+
+    Calls the agent, then replays every SQL the agent emitted (the
+    generate_sql + revise entries in its history, in order) against the DB and
+    compares each to the gold result set. per_iter[k] is whether the SQL the
+    agent held after iteration k would have answered the question correctly.
+    """
+    db_id = question["db_id"]
+    gold_ok, gold_rows, gold_err = run_sql(db_id, question["gold_sql"])
+
+    record: dict = {
+        "question": question["question"],
+        "db_id": db_id,
+        "gold_ok": gold_ok,
+        "gold_error": gold_err,
+        "agent_ok": False,
+        "agent_error": None,
+        "per_iter": [],      # correctness after each iteration
+        "iterations": 0,     # how many SQLs the agent emitted
+        "final_correct": False,
+    }
+
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": question["question"], "db": db_id, "tags": {"eval": "baseline"}},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        record["agent_error"] = f"{type(e).__name__}: {e}"
+        return record
+
+    record["agent_ok"] = bool(data.get("ok"))
+    record["agent_error"] = data.get("error")
+
+    # Each generate_sql / revise step is one iteration's candidate SQL, in order.
+    iter_sqls = [h["sql"] for h in data.get("history", []) if h.get("node") in ("generate_sql", "revise")]
+    record["iterations"] = len(iter_sqls)
+
+    for sql in iter_sqls:
+        pred_ok, pred_rows, _ = run_sql(db_id, sql)
+        record["per_iter"].append(bool(pred_ok and matches(gold_rows, pred_rows)))
+
+    record["final_correct"] = record["per_iter"][-1] if record["per_iter"] else False
+    return record
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +115,34 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    max_iters = max((len(r["per_iter"]) for r in results), default=0)
+
+    def correct_at(r: dict, k: int) -> bool:
+        # Carry forward the last emitted iteration if the agent stopped before k.
+        pi = r["per_iter"]
+        if not pi:
+            return False
+        return pi[k] if k < len(pi) else pi[-1]
+
+    pass_at_iter = [
+        (sum(correct_at(r, k) for r in results) / n if n else 0.0)
+        for k in range(max_iters)
+    ]
+
+    final_correct = sum(r["final_correct"] for r in results)
+    iter_counts = [r["iterations"] for r in results]
+
+    return {
+        "total": n,
+        "passed": final_correct,
+        "pass_rate": (final_correct / n) if n else 0.0,
+        "pass_rate_at_iteration": pass_at_iter,
+        "loop_lift": (pass_at_iter[-1] - pass_at_iter[0]) if pass_at_iter else 0.0,
+        "avg_iterations": (sum(iter_counts) / n) if n else 0.0,
+        "agent_errors": sum(1 for r in results if r["agent_error"]),
+        "gold_errors": sum(1 for r in results if not r["gold_ok"]),
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
