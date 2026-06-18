@@ -30,8 +30,9 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Cut from 3 to 2: eval showed pass-rate peaks at one revise (iter 1) and the
+# 2nd revise was net-negative, while the extra calls dominate the latency tail.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -62,6 +63,9 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        # SQL + a short JSON verdict fit easily; cap decode so a run-on
+        # generation can't blow up per-request latency.
+        max_tokens=512,
     )
 
 
@@ -179,6 +183,18 @@ async def revise_node(state: AgentState) -> dict:
     }
 
 
+def route_after_execute(state: AgentState) -> str:
+    """Conditional router after execute: "verify" or skip straight to "end".
+
+    Once we've spent the iteration budget, verify can't trigger another revise,
+    so running it would be a wasted LLM call on every cap-hitting run (the slow
+    tail). Skip it and return whatever the last execution produced.
+    """
+    if state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "verify"
+
+
 def route_after_verify(state: AgentState) -> str:
     """Conditional router: return "revise" to loop, "end" to terminate.
 
@@ -203,7 +219,11 @@ def build_graph():
     g.add_edge(START, "attach_schema")
     g.add_edge("attach_schema", "generate_sql")
     g.add_edge("generate_sql", "execute")
-    g.add_edge("execute", "verify")
+    g.add_conditional_edges(
+        "execute",
+        route_after_execute,
+        {"verify": "verify", "end": END},
+    )
     g.add_conditional_edges(
         "verify",
         route_after_verify,

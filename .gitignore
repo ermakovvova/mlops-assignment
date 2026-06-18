@@ -28,3 +28,6 @@ screenshots/*.jpg
 
 # Lecture material (not part of the student repo)
 *.pdf
+
+# build artifact
+submission.zip
