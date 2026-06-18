@@ -82,17 +82,20 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
     and return only the state fields you changed. `iteration` is bumped here
     (and in revise) so route_after_verify can enforce MAX_ITERATIONS.
 
+    Async so many concurrent agent runs share the event loop instead of being
+    capped by a thread pool; the vLLM call is awaited, not blocking.
+
     This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
     in prompts.py to make it produce real queries.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -132,10 +135,10 @@ def _parse_verdict(text: str) -> tuple[bool, str]:
     return ok, ("" if ok else issue)
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question."""
     result_text = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.VERIFY_SYSTEM),
         ("user", prompts.VERIFY_USER.format(
             question=state.question,
@@ -153,10 +156,10 @@ def verify_node(state: AgentState) -> dict:
     }
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt."""
     result_text = state.execution.render() if state.execution else "ERROR: no execution result"
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.REVISE_SYSTEM),
         ("user", prompts.REVISE_USER.format(
             schema=state.schema,

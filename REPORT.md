@@ -13,7 +13,7 @@ uv run python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --host 0.0.0.0 \
     --port 8000 \
-    --max-model-len 32768
+    --max-model-len 8192
 ```
 
 ### Configuration Flags
@@ -30,7 +30,7 @@ uv run python -m vllm.entrypoints.openai.api_server \
 
 2. **Missing Python headers:** Triton's CUDA driver shim needs `Python.h` to compile. Fixed with `sudo apt install python3.12-dev`.
 
-3. **KV cache OOM:** Model weights occupy ~57 GiB on the H100 80GB, leaving ~8.6 GiB for KV cache. The default 262k context needs 24 GiB. Reduced via `--max-model-len 32768`.
+3. **KV cache OOM:** Model weights occupy ~57 GiB on the H100 80GB, leaving ~8.6 GiB for KV cache. The default 262k context needs 24 GiB. Reduced via `--max-model-len 8192`.
 
 ### Observability Stack
 
