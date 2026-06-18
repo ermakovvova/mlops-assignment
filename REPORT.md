@@ -114,3 +114,45 @@ uv run uvicorn agent.server:app --host 0.0.0.0 --port 8001
 curl -X POST http://localhost:8001/answer -H "Content-Type: application/json" \
   -d '{"question": "...", "db": "formula_1"}'
 ```
+
+```aiignore
+curl -X POST http://localhost:8001/answer   -H "Content-Type: application/json"   -d '{"question": "Calculate the percentage of carcinogenic molecules which contain the Chlorine element.", "db": "toxicology"}' | jq '{ok, iterations, history}'
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+100  2914  100  2792  100   122    821     35  0:00:03  0:00:03 --:--:--   857
+{
+  "ok": true,
+  "iterations": 3,
+  "history": [
+    {
+      "node": "generate_sql",
+      "sql": "SELECT \n  (COUNT(CASE WHEN m.\"label\" = 'carcinogenic' THEN 1 END) * 100.0 / COUNT(*)) AS percentage\nFROM \"molecule\" m\nJOIN \"atom\" a ON m.\"molecule_id\" = a.\"molecule_id\"\nWHERE a.\"element\" = 'Cl';"
+    },
+    {
+      "node": "verify",
+      "ok": false,
+      "issue": "The SQL calculates the percentage of molecules containing Chlorine that are carcinogenic, but the question asks for the percentage of carcinogenic molecules that contain Chlorine. The logic is inverted."
+    },
+    {
+      "node": "revise",
+      "sql": "SELECT \n  (COUNT(CASE WHEN a.\"element\" = 'Cl' THEN 1 END) * 100.0 / COUNT(CASE WHEN m.\"label\" = 'carcinogenic' THEN 1 END)) AS percentage\nFROM \"molecule\" m\nJOIN \"atom\" a ON m.\"molecule_id\" = a.\"molecule_id\"\nWHERE m.\"label\" = 'carcinogenic';",
+      "fixing": "The SQL calculates the percentage of molecules containing Chlorine that are carcinogenic, but the question asks for the percentage of carcinogenic molecules that contain Chlorine. The logic is inverted."
+    },
+    {
+      "node": "verify",
+      "ok": false,
+      "issue": "The SQL incorrectly calculates the percentage by dividing the count of Cl atoms by the count of carcinogenic molecules, but it should divide the count of carcinogenic molecules containing Cl by the total count of carcinogenic molecules. The current query uses a flawed logic that doesn't properly count molecules with Cl, and the result is empty, indicating no data was returned."
+    },
+    {
+      "node": "revise",
+      "sql": "SELECT \n  (COUNT(CASE WHEN a.\"element\" = 'Cl' THEN 1 END) * 100.0 / COUNT(*)) AS percentage\nFROM \"molecule\" m\nJOIN \"atom\" a ON m.\"molecule_id\" = a.\"molecule_id\"\nWHERE m.\"label\" = 'carcinogenic'\nGROUP BY m.\"molecule_id\"\nHAVING COUNT(CASE WHEN a.\"element\" = 'Cl' THEN 1 END) > 0;",
+      "fixing": "The SQL incorrectly calculates the percentage by dividing the count of Cl atoms by the count of carcinogenic molecules, but it should divide the count of carcinogenic molecules containing Cl by the total count of carcinogenic molecules. The current query uses a flawed logic that doesn't properly count molecules with Cl, and the result is empty, indicating no data was returned."
+    },
+    {
+      "node": "verify",
+      "ok": false,
+      "issue": "The query returns 0 rows, but the question asks for a percentage, which should be a single value. The GROUP BY and HAVING clauses are incorrect for this aggregate calculation, and the result set is empty when at least one row with a percentage should be returned."
+    }
+  ]
+}
+```

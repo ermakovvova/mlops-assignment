@@ -35,7 +35,7 @@ app = FastAPI()
 class AnswerRequest(BaseModel):
     question: str
     db: str
-    tags: dict[str, str] = {}
+    tags: dict[str, Any] = {}
 
 
 class AnswerResponse(BaseModel):
